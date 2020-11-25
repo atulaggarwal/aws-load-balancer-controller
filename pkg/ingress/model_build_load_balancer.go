@@ -13,8 +13,10 @@ import (
 	"regexp"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/annotations"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/equality"
+	"sigs.k8s.io/aws-load-balancer-controller/pkg/k8s"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/model/core"
 	elbv2model "sigs.k8s.io/aws-load-balancer-controller/pkg/model/elbv2"
+	"sigs.k8s.io/aws-load-balancer-controller/pkg/networking"
 	"strings"
 )
 
@@ -49,6 +51,10 @@ func (t *defaultModelBuildTask) buildLoadBalancerSpec(ctx context.Context, liste
 	if err != nil {
 		return elbv2model.LoadBalancerSpec{}, err
 	}
+	coIPv4Pool, err := t.buildLoadBalancerCOIPv4Pool(ctx)
+	if err != nil {
+		return elbv2model.LoadBalancerSpec{}, err
+	}
 	loadBalancerAttributes, err := t.buildLoadBalancerAttributes(ctx)
 	if err != nil {
 		return elbv2model.LoadBalancerSpec{}, err
@@ -65,6 +71,7 @@ func (t *defaultModelBuildTask) buildLoadBalancerSpec(ctx context.Context, liste
 		IPAddressType:          &ipAddressType,
 		SubnetMappings:         subnetMappings,
 		SecurityGroups:         securityGroups,
+		CustomerOwnedIPv4Pool:  coIPv4Pool,
 		LoadBalancerAttributes: loadBalancerAttributes,
 		Tags:                   tags,
 	}, nil
@@ -151,19 +158,16 @@ func (t *defaultModelBuildTask) buildLoadBalancerSubnetMappings(ctx context.Cont
 		}
 		explicitSubnetNameOrIDsList = append(explicitSubnetNameOrIDsList, rawSubnetNameOrIDs)
 	}
+
 	if len(explicitSubnetNameOrIDsList) == 0 {
-		chosenSubnets, err := t.subnetsResolver.DiscoverSubnets(ctx, scheme)
+		chosenSubnets, err := t.subnetsResolver.ResolveViaDiscovery(ctx,
+			networking.WithSubnetsResolveLBType(elbv2model.LoadBalancerTypeApplication),
+			networking.WithSubnetsResolveLBScheme(scheme),
+		)
 		if err != nil {
-			return nil, err
+			return nil, errors.Wrap(err, "couldn't auto-discover subnets")
 		}
-		var chosenSubnetIDs []string
-		for _, subnet := range chosenSubnets {
-			chosenSubnetIDs = append(chosenSubnetIDs, awssdk.StringValue(subnet.SubnetId))
-		}
-		if len(chosenSubnetIDs) < 2 {
-			return nil, errors.Errorf("cannot find at least two subnets from different Availability Zones, discovered subnetIDs: %v", chosenSubnetIDs)
-		}
-		return buildLoadBalancerSubnetMappingsWithSubnetIDs(chosenSubnetIDs), nil
+		return buildLoadBalancerSubnetMappingsWithSubnets(chosenSubnets), nil
 	}
 
 	chosenSubnetNameOrIDs := explicitSubnetNameOrIDsList[0]
@@ -173,11 +177,14 @@ func (t *defaultModelBuildTask) buildLoadBalancerSubnetMappings(ctx context.Cont
 			return nil, errors.Errorf("conflicting subnets: %v | %v", chosenSubnetNameOrIDs, subnetNameOrIDs)
 		}
 	}
-	chosenSubnetIDs, err := t.resolveSubnetIDsViaNameOrIDSlice(ctx, chosenSubnetNameOrIDs)
+	chosenSubnets, err := t.subnetsResolver.ResolveViaNameOrIDSlice(ctx, chosenSubnetNameOrIDs,
+		networking.WithSubnetsResolveLBType(elbv2model.LoadBalancerTypeApplication),
+		networking.WithSubnetsResolveLBScheme(scheme),
+	)
 	if err != nil {
 		return nil, err
 	}
-	return buildLoadBalancerSubnetMappingsWithSubnetIDs(chosenSubnetIDs), nil
+	return buildLoadBalancerSubnetMappingsWithSubnets(chosenSubnets), nil
 }
 
 func (t *defaultModelBuildTask) buildLoadBalancerSecurityGroups(ctx context.Context, listenPortConfigByPort map[int64]listenPortConfig, ipAddressType elbv2model.IPAddressType) ([]core.StringToken, error) {
@@ -213,6 +220,31 @@ func (t *defaultModelBuildTask) buildLoadBalancerSecurityGroups(ctx context.Cont
 		sgIDTokens = append(sgIDTokens, core.LiteralStringToken(sgID))
 	}
 	return sgIDTokens, nil
+}
+
+func (t *defaultModelBuildTask) buildLoadBalancerCOIPv4Pool(_ context.Context) (*string, error) {
+	explicitCOIPv4Pools := sets.NewString()
+	for _, ing := range t.ingGroup.Members {
+		rawCOIPv4Pool := ""
+		if exists := t.annotationParser.ParseStringAnnotation(annotations.IngressSuffixCustomerOwnedIPv4Pool, &rawCOIPv4Pool, ing.Annotations); !exists {
+			continue
+		}
+		if len(rawCOIPv4Pool) == 0 {
+			return nil, errors.Errorf("cannot use empty value for %s annotation, ingress: %v",
+				annotations.IngressSuffixCustomerOwnedIPv4Pool, k8s.NamespacedName(ing))
+		}
+		explicitCOIPv4Pools.Insert(rawCOIPv4Pool)
+	}
+
+	if len(explicitCOIPv4Pools) == 0 {
+		return nil, nil
+	}
+	if len(explicitCOIPv4Pools) > 1 {
+		return nil, errors.Errorf("conflicting CustomerOwnedIPv4Pool: %v", explicitCOIPv4Pools.List())
+	}
+
+	rawCOIPv4Pool, _ := explicitCOIPv4Pools.PopAny()
+	return &rawCOIPv4Pool, nil
 }
 
 func (t *defaultModelBuildTask) buildLoadBalancerAttributes(_ context.Context) ([]elbv2model.LoadBalancerAttribute, error) {
@@ -254,57 +286,6 @@ func (t *defaultModelBuildTask) buildLoadBalancerTags(_ context.Context) (map[st
 		}
 	}
 	return mergedTags, nil
-}
-
-// resolveSubnetIDsViaNameOrIDSlice resolves the subnetIDs for LoadBalancer via a slice of subnetName or subnetIDs.
-func (t *defaultModelBuildTask) resolveSubnetIDsViaNameOrIDSlice(ctx context.Context, subnetNameOrIDs []string) ([]string, error) {
-	var subnetIDs []string
-	var subnetNames []string
-	for _, nameOrID := range subnetNameOrIDs {
-		if strings.HasPrefix(nameOrID, "subnet-") {
-			subnetIDs = append(subnetIDs, nameOrID)
-		} else {
-			subnetNames = append(subnetNames, nameOrID)
-		}
-	}
-	var resolvedSubnets []*ec2sdk.Subnet
-	if len(subnetIDs) > 0 {
-		req := &ec2sdk.DescribeSubnetsInput{
-			SubnetIds: awssdk.StringSlice(subnetIDs),
-		}
-		subnets, err := t.ec2Client.DescribeSubnetsAsList(ctx, req)
-		if err != nil {
-			return nil, err
-		}
-		resolvedSubnets = append(resolvedSubnets, subnets...)
-	}
-	if len(subnetNames) > 0 {
-		req := &ec2sdk.DescribeSubnetsInput{
-			Filters: []*ec2sdk.Filter{
-				{
-					Name:   awssdk.String("tag:Name"),
-					Values: awssdk.StringSlice(subnetNames),
-				},
-				{
-					Name:   awssdk.String("vpc-id"),
-					Values: awssdk.StringSlice([]string{t.vpcID}),
-				},
-			},
-		}
-		subnets, err := t.ec2Client.DescribeSubnetsAsList(ctx, req)
-		if err != nil {
-			return nil, err
-		}
-		resolvedSubnets = append(resolvedSubnets, subnets...)
-	}
-	resolvedSubnetIDs := make([]string, 0, len(resolvedSubnets))
-	for _, subnet := range resolvedSubnets {
-		resolvedSubnetIDs = append(resolvedSubnetIDs, awssdk.StringValue(subnet.SubnetId))
-	}
-	if len(resolvedSubnetIDs) != len(subnetNameOrIDs) {
-		return nil, errors.Errorf("couldn't found all subnets, nameOrIDs: %v, found: %v", subnetNameOrIDs, resolvedSubnetIDs)
-	}
-	return resolvedSubnetIDs, nil
 }
 
 func (t *defaultModelBuildTask) resolveSecurityGroupIDsViaNameOrIDSlice(ctx context.Context, sgNameOrIDs []string) ([]string, error) {
@@ -357,11 +338,11 @@ func (t *defaultModelBuildTask) resolveSecurityGroupIDsViaNameOrIDSlice(ctx cont
 	return resolvedSGIDs, nil
 }
 
-func buildLoadBalancerSubnetMappingsWithSubnetIDs(subnetIDs []string) []elbv2model.SubnetMapping {
-	subnetMappings := make([]elbv2model.SubnetMapping, 0, len(subnetIDs))
-	for _, subnetID := range subnetIDs {
+func buildLoadBalancerSubnetMappingsWithSubnets(subnets []*ec2sdk.Subnet) []elbv2model.SubnetMapping {
+	subnetMappings := make([]elbv2model.SubnetMapping, 0, len(subnets))
+	for _, subnet := range subnets {
 		subnetMappings = append(subnetMappings, elbv2model.SubnetMapping{
-			SubnetID: subnetID,
+			SubnetID: awssdk.StringValue(subnet.SubnetId),
 		})
 	}
 	return subnetMappings

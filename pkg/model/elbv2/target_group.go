@@ -60,7 +60,10 @@ const (
 // Information to use when checking for a successful response from a target.
 type HealthCheckMatcher struct {
 	// The HTTP codes.
-	HTTPCode string `json:"httpCode"`
+	HTTPCode *string `json:"httpCode,omitempty"`
+
+	// The gRPC codes
+	GRPCCode *string `json:"grpcCode,omitempty"`
 }
 
 // Configuration for TargetGroup's HealthCheck.
@@ -120,6 +123,10 @@ type TargetGroupSpec struct {
 
 	// The protocol to use for routing traffic to the targets.
 	Protocol Protocol `json:"protocol"`
+
+	// The target group protocol version.
+	// +optional
+	ProtocolVersion *ProtocolVersion `json:"protocolVersion,omitempty"`
 
 	// Configuration for TargetGroup's HealthCheck.
 	// +optional

@@ -17,6 +17,7 @@ import (
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/annotations"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/k8s"
 	elbv2model "sigs.k8s.io/aws-load-balancer-controller/pkg/model/elbv2"
+	"strconv"
 )
 
 const (
@@ -105,11 +106,15 @@ func (t *defaultModelBuildTask) buildTargetGroupSpec(ctx context.Context,
 	if err != nil {
 		return elbv2model.TargetGroupSpec{}, err
 	}
-	healthCheckConfig, err := t.buildTargetGroupHealthCheckConfig(ctx, svc, svcAndIngAnnotations, targetType, tgProtocol)
+	tgProtocolVersion, err := t.buildTargetGroupProtocolVersion(ctx, svcAndIngAnnotations)
 	if err != nil {
 		return elbv2model.TargetGroupSpec{}, err
 	}
-	targetGroupAttributes, err := t.buildTargetGroupAttributes(ctx, svcAndIngAnnotations)
+	healthCheckConfig, err := t.buildTargetGroupHealthCheckConfig(ctx, svc, svcAndIngAnnotations, targetType, tgProtocol, tgProtocolVersion)
+	if err != nil {
+		return elbv2model.TargetGroupSpec{}, err
+	}
+	tgAttributes, err := t.buildTargetGroupAttributes(ctx, svcAndIngAnnotations)
 	if err != nil {
 		return elbv2model.TargetGroupSpec{}, err
 	}
@@ -121,27 +126,26 @@ func (t *defaultModelBuildTask) buildTargetGroupSpec(ctx context.Context,
 	if err != nil {
 		return elbv2model.TargetGroupSpec{}, err
 	}
-	targetGroupPort := 1
-	if svcPort.TargetPort.Type == intstr.Int {
-		targetGroupPort = svcPort.TargetPort.IntValue()
-	}
-	name := t.buildTargetGroupName(ctx, k8s.NamespacedName(ing), svc, svcPort.TargetPort, targetType, tgProtocol)
+	tgPort := t.buildTargetGroupPort(ctx, targetType, svcPort)
+	name := t.buildTargetGroupName(ctx, k8s.NamespacedName(ing), svc, port, tgPort, targetType, tgProtocol, tgProtocolVersion)
 	return elbv2model.TargetGroupSpec{
 		Name:                  name,
 		TargetType:            targetType,
-		Port:                  int64(targetGroupPort),
+		Port:                  tgPort,
 		Protocol:              tgProtocol,
+		ProtocolVersion:       &tgProtocolVersion,
 		HealthCheckConfig:     &healthCheckConfig,
-		TargetGroupAttributes: targetGroupAttributes,
+		TargetGroupAttributes: tgAttributes,
 		Tags:                  tags,
 	}, nil
 }
 
 var invalidTargetGroupNamePattern = regexp.MustCompile("[[:^alnum:]]")
 
+// buildTargetGroupName will calculate the targetGroup's name.
 func (t *defaultModelBuildTask) buildTargetGroupName(_ context.Context,
-	ingKey types.NamespacedName, svc *corev1.Service, port intstr.IntOrString,
-	targetType elbv2model.TargetType, tgProtocol elbv2model.Protocol) string {
+	ingKey types.NamespacedName, svc *corev1.Service, port intstr.IntOrString, tgPort int64,
+	targetType elbv2model.TargetType, tgProtocol elbv2model.Protocol, tgProtocolVersion elbv2model.ProtocolVersion) string {
 	uuidHash := sha256.New()
 	_, _ = uuidHash.Write([]byte(t.clusterName))
 	_, _ = uuidHash.Write([]byte(t.ingGroup.ID.String()))
@@ -149,8 +153,10 @@ func (t *defaultModelBuildTask) buildTargetGroupName(_ context.Context,
 	_, _ = uuidHash.Write([]byte(ingKey.Name))
 	_, _ = uuidHash.Write([]byte(svc.UID))
 	_, _ = uuidHash.Write([]byte(port.String()))
+	_, _ = uuidHash.Write([]byte(strconv.Itoa(int(tgPort))))
 	_, _ = uuidHash.Write([]byte(targetType))
 	_, _ = uuidHash.Write([]byte(tgProtocol))
+	_, _ = uuidHash.Write([]byte(tgProtocolVersion))
 	uuid := hex.EncodeToString(uuidHash.Sum(nil))
 
 	sanitizedNamespace := invalidTargetGroupNamePattern.ReplaceAllString(svc.Namespace, "")
@@ -171,6 +177,22 @@ func (t *defaultModelBuildTask) buildTargetGroupTargetType(_ context.Context, sv
 	}
 }
 
+// buildTargetGroupPort constructs the TargetGroup's port.
+// Note: TargetGroup's port is not in the data path as we always register targets with port specified.
+// so this settings don't really matter to our controller, and we do our best to use the most appropriate port as targetGroup's port to avoid UX confusing.
+func (t *defaultModelBuildTask) buildTargetGroupPort(_ context.Context, targetType elbv2model.TargetType, svcPort corev1.ServicePort) int64 {
+	if targetType == elbv2model.TargetTypeInstance {
+		return int64(svcPort.NodePort)
+	}
+	if svcPort.TargetPort.Type == intstr.Int {
+		return int64(svcPort.TargetPort.IntValue())
+	}
+
+	// when a literal targetPort is used, we just use a fixed 1 here as this setting is not in the data path.
+	// also, under extreme edge case, it can actually be different ports for different pods.
+	return 1
+}
+
 func (t *defaultModelBuildTask) buildTargetGroupProtocol(_ context.Context, svcAndIngAnnotations map[string]string) (elbv2model.Protocol, error) {
 	rawBackendProtocol := string(t.defaultBackendProtocol)
 	_ = t.annotationParser.ParseStringAnnotation(annotations.IngressSuffixBackendProtocol, &rawBackendProtocol, svcAndIngAnnotations)
@@ -184,7 +206,22 @@ func (t *defaultModelBuildTask) buildTargetGroupProtocol(_ context.Context, svcA
 	}
 }
 
-func (t *defaultModelBuildTask) buildTargetGroupHealthCheckConfig(ctx context.Context, svc *corev1.Service, svcAndIngAnnotations map[string]string, targetType elbv2model.TargetType, tgProtocol elbv2model.Protocol) (elbv2model.TargetGroupHealthCheckConfig, error) {
+func (t *defaultModelBuildTask) buildTargetGroupProtocolVersion(_ context.Context, svcAndIngAnnotations map[string]string) (elbv2model.ProtocolVersion, error) {
+	rawBackendProtocolVersion := string(t.defaultBackendProtocolVersion)
+	_ = t.annotationParser.ParseStringAnnotation(annotations.IngressSuffixBackendProtocolVersion, &rawBackendProtocolVersion, svcAndIngAnnotations)
+	switch rawBackendProtocolVersion {
+	case string(elbv2model.ProtocolVersionHTTP1):
+		return elbv2model.ProtocolVersionHTTP1, nil
+	case string(elbv2model.ProtocolVersionHTTP2):
+		return elbv2model.ProtocolVersionHTTP2, nil
+	case string(elbv2model.ProtocolVersionGRPC):
+		return elbv2model.ProtocolVersionGRPC, nil
+	default:
+		return "", errors.Errorf("backend protocol version must be within [%v, %v, %v]: %v", elbv2model.ProtocolVersionHTTP1, elbv2model.ProtocolVersionHTTP2, elbv2model.ProtocolVersionGRPC, rawBackendProtocolVersion)
+	}
+}
+
+func (t *defaultModelBuildTask) buildTargetGroupHealthCheckConfig(ctx context.Context, svc *corev1.Service, svcAndIngAnnotations map[string]string, targetType elbv2model.TargetType, tgProtocol elbv2model.Protocol, tgProtocolVersion elbv2model.ProtocolVersion) (elbv2model.TargetGroupHealthCheckConfig, error) {
 	healthCheckPort, err := t.buildTargetGroupHealthCheckPort(ctx, svc, svcAndIngAnnotations, targetType)
 	if err != nil {
 		return elbv2model.TargetGroupHealthCheckConfig{}, err
@@ -194,7 +231,7 @@ func (t *defaultModelBuildTask) buildTargetGroupHealthCheckConfig(ctx context.Co
 		return elbv2model.TargetGroupHealthCheckConfig{}, err
 	}
 	healthCheckPath := t.buildTargetGroupHealthCheckPath(ctx, svcAndIngAnnotations)
-	healthCheckMatcher := t.buildTargetGroupHealthCheckMatcher(ctx, svcAndIngAnnotations)
+	healthCheckMatcher := t.buildTargetGroupHealthCheckMatcher(ctx, svcAndIngAnnotations, tgProtocolVersion)
 	healthCheckIntervalSeconds, err := t.buildTargetGroupHealthCheckIntervalSeconds(ctx, svcAndIngAnnotations)
 	if err != nil {
 		return elbv2model.TargetGroupHealthCheckConfig{}, err
@@ -268,11 +305,16 @@ func (t *defaultModelBuildTask) buildTargetGroupHealthCheckPath(_ context.Contex
 	return rawHealthCheckPath
 }
 
-func (t *defaultModelBuildTask) buildTargetGroupHealthCheckMatcher(_ context.Context, svcAndIngAnnotations map[string]string) elbv2model.HealthCheckMatcher {
+func (t *defaultModelBuildTask) buildTargetGroupHealthCheckMatcher(_ context.Context, svcAndIngAnnotations map[string]string, tgProtocolVersion elbv2model.ProtocolVersion) elbv2model.HealthCheckMatcher {
 	rawHealthCheckMatcherHTTPCode := t.defaultHealthCheckMatcherHTTPCode
 	_ = t.annotationParser.ParseStringAnnotation(annotations.IngressSuffixSuccessCodes, &rawHealthCheckMatcherHTTPCode, svcAndIngAnnotations)
+	if tgProtocolVersion == elbv2model.ProtocolVersionGRPC {
+		return elbv2model.HealthCheckMatcher{
+			GRPCCode: &rawHealthCheckMatcherHTTPCode,
+		}
+	}
 	return elbv2model.HealthCheckMatcher{
-		HTTPCode: rawHealthCheckMatcherHTTPCode,
+		HTTPCode: &rawHealthCheckMatcherHTTPCode,
 	}
 }
 

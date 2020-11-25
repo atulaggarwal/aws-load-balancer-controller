@@ -7,10 +7,10 @@ import (
 	elbv2sdk "github.com/aws/aws-sdk-go/service/elbv2"
 	"github.com/go-logr/logr"
 	"github.com/pkg/errors"
-	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/aws/services"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/deploy/tracking"
 	elbv2model "sigs.k8s.io/aws-load-balancer-controller/pkg/model/elbv2"
+	"sigs.k8s.io/aws-load-balancer-controller/pkg/runtime"
 	"time"
 )
 
@@ -107,19 +107,12 @@ func (m *defaultTargetGroupManager) Delete(ctx context.Context, sdkTG TargetGrou
 		TargetGroupArn: sdkTG.TargetGroup.TargetGroupArn,
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, m.waitTGDeletionTimeout)
-	defer cancel()
 	m.logger.Info("deleting targetGroup",
 		"arn", awssdk.StringValue(req.TargetGroupArn))
-	if err := wait.PollImmediateUntil(m.waitTGDeletionPollInterval, func() (done bool, err error) {
-		if _, err := m.elbv2Client.DeleteTargetGroupWithContext(ctx, req); err != nil {
-			if awsErr, ok := err.(awserr.Error); ok && awsErr.Code() == "ResourceInUse" {
-				return false, nil
-			}
-			return false, err
-		}
-		return true, nil
-	}, ctx.Done()); err != nil {
+	if err := runtime.RetryImmediateOnError(m.waitTGDeletionPollInterval, m.waitTGDeletionTimeout, isTargetGroupResourceInUseError, func() error {
+		_, err := m.elbv2Client.DeleteTargetGroupWithContext(ctx, req)
+		return err
+	}); err != nil {
 		return errors.Wrap(err, "failed to delete targetGroup")
 	}
 	m.logger.Info("deleted targetGroup",
@@ -172,7 +165,7 @@ func isSDKTargetGroupHealthCheckDrifted(tgSpec elbv2model.TargetGroupSpec, sdkTG
 	if hcConfig.Path != nil && awssdk.StringValue(hcConfig.Path) != awssdk.StringValue(sdkObj.HealthCheckPath) {
 		return true
 	}
-	if hcConfig.Matcher != nil && (sdkObj.Matcher == nil || hcConfig.Matcher.HTTPCode != awssdk.StringValue(sdkObj.Matcher.HttpCode)) {
+	if hcConfig.Matcher != nil && (sdkObj.Matcher == nil || awssdk.StringValue(hcConfig.Matcher.GRPCCode) != awssdk.StringValue(sdkObj.Matcher.GrpcCode) || awssdk.StringValue(hcConfig.Matcher.HTTPCode) != awssdk.StringValue(sdkObj.Matcher.HttpCode)) {
 		return true
 	}
 	if hcConfig.IntervalSeconds != nil && awssdk.Int64Value(hcConfig.IntervalSeconds) != awssdk.Int64Value(sdkObj.HealthCheckIntervalSeconds) {
@@ -196,6 +189,9 @@ func buildSDKCreateTargetGroupInput(tgSpec elbv2model.TargetGroupSpec) *elbv2sdk
 	sdkObj.TargetType = awssdk.String(string(tgSpec.TargetType))
 	sdkObj.Port = awssdk.Int64(tgSpec.Port)
 	sdkObj.Protocol = awssdk.String(string(tgSpec.Protocol))
+	if tgSpec.ProtocolVersion != nil {
+		sdkObj.ProtocolVersion = (*string)(tgSpec.ProtocolVersion)
+	}
 	if tgSpec.HealthCheckConfig != nil {
 		hcConfig := *tgSpec.HealthCheckConfig
 		sdkObj.HealthCheckEnabled = awssdk.Bool(true)
@@ -239,7 +235,8 @@ func buildSDKModifyTargetGroupInput(tgSpec elbv2model.TargetGroupSpec) *elbv2sdk
 
 func buildSDKMatcher(modelMatcher elbv2model.HealthCheckMatcher) *elbv2sdk.Matcher {
 	return &elbv2sdk.Matcher{
-		HttpCode: awssdk.String(modelMatcher.HTTPCode),
+		GrpcCode: modelMatcher.GRPCCode,
+		HttpCode: modelMatcher.HTTPCode,
 	}
 }
 
@@ -247,4 +244,12 @@ func buildResTargetGroupStatus(sdkTG TargetGroupWithTags) elbv2model.TargetGroup
 	return elbv2model.TargetGroupStatus{
 		TargetGroupARN: awssdk.StringValue(sdkTG.TargetGroup.TargetGroupArn),
 	}
+}
+
+func isTargetGroupResourceInUseError(err error) bool {
+	var awsErr awserr.Error
+	if errors.As(err, &awsErr) {
+		return awsErr.Code() == "ResourceInUse"
+	}
+	return false
 }

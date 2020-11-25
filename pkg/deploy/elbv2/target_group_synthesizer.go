@@ -162,11 +162,13 @@ func isSDKTargetGroupRequiresReplacement(sdkTG TargetGroupWithTags, resTG *elbv2
 	if string(resTG.Spec.TargetType) != awssdk.StringValue(sdkTG.TargetGroup.TargetType) {
 		return true
 	}
-	if resTG.Spec.Port != awssdk.Int64Value(sdkTG.TargetGroup.Port) {
-		return true
-	}
 	if string(resTG.Spec.Protocol) != awssdk.StringValue(sdkTG.TargetGroup.Protocol) {
 		return true
+	}
+	if resTG.Spec.ProtocolVersion != nil {
+		if string(*resTG.Spec.ProtocolVersion) != awssdk.StringValue(sdkTG.TargetGroup.ProtocolVersion) {
+			return true
+		}
 	}
 
 	return isSDKTargetGroupRequiresReplacementDueToNLBHealthCheck(sdkTG, resTG)
@@ -186,7 +188,7 @@ func isSDKTargetGroupRequiresReplacementDueToNLBHealthCheck(sdkTG TargetGroupWit
 	if hcConfig.Protocol != nil && string(*hcConfig.Protocol) != awssdk.StringValue(sdkObj.HealthCheckProtocol) {
 		return true
 	}
-	if hcConfig.Matcher != nil && (sdkObj.Matcher == nil || hcConfig.Matcher.HTTPCode != awssdk.StringValue(sdkObj.Matcher.HttpCode)) {
+	if hcConfig.Matcher != nil && (sdkObj.Matcher == nil || awssdk.StringValue(hcConfig.Matcher.GRPCCode) != awssdk.StringValue(sdkObj.Matcher.GrpcCode) || awssdk.StringValue(hcConfig.Matcher.HTTPCode) != awssdk.StringValue(sdkObj.Matcher.HttpCode)) {
 		return true
 	}
 	if hcConfig.IntervalSeconds != nil && awssdk.Int64Value(hcConfig.IntervalSeconds) != awssdk.Int64Value(sdkObj.HealthCheckIntervalSeconds) {

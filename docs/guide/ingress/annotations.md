@@ -23,6 +23,7 @@ You can add annotations to kubernetes Ingress and Service objects to customize t
 |[alb.ingress.kubernetes.io/scheme](#scheme)|internal \| internet-facing|internal|Ingress|Exclusive|
 |[alb.ingress.kubernetes.io/subnets](#subnets)|stringList|N/A|Ingress|Exclusive|
 |[alb.ingress.kubernetes.io/security-groups](#security-groups)|stringList|N/A|Ingress|Exclusive|
+|[alb.ingress.kubernetes.io/customer-owned-ipv4-pool](#customer-owned-ipv4-pool)|string|N/A|Ingress|Exclusive|
 |[alb.ingress.kubernetes.io/load-balancer-attributes](#load-balancer-attributes)|stringMap|N/A|Ingress|Merge|
 |[alb.ingress.kubernetes.io/wafv2-acl-arn](#wafv2-acl-arn)|string|N/A|Ingress|Exclusive|
 |[alb.ingress.kubernetes.io/waf-acl-id](#waf-acl-id)|string|N/A|Ingress|Exclusive|
@@ -33,6 +34,7 @@ You can add annotations to kubernetes Ingress and Service objects to customize t
 |[alb.ingress.kubernetes.io/ssl-policy](#ssl-policy)|string|ELBSecurityPolicy-2016-08|Ingress|Exclusive|
 |[alb.ingress.kubernetes.io/target-type](#target-type)|instance \| ip|instance|Ingress,Service|N/A|
 |[alb.ingress.kubernetes.io/backend-protocol](#backend-protocol)|HTTP \| HTTPS|HTTP|Ingress,Service|N/A|
+|[alb.ingress.kubernetes.io/backend-protocol-version](#backend-protocol-version)|string | HTTP1 |Ingress,Service|N/A|
 |[alb.ingress.kubernetes.io/target-group-attributes](#target-group-attributes)|stringMap|N/A|Ingress,Service|N/A|
 |[alb.ingress.kubernetes.io/healthcheck-port](#healthcheck-port)|integer \| traffic-port|traffic-port|Ingress,Service|N/A|
 |[alb.ingress.kubernetes.io/healthcheck-protocol](#healthcheck-protocol)|HTTP \| HTTPS|HTTP|Ingress,Service|N/A|
@@ -123,6 +125,16 @@ Traffic Listening can be controlled with following annotations:
         alb.ingress.kubernetes.io/ip-address-type: ipv4
         ```
 
+- <a name="customer-owned-ipv4-pool">`alb.ingress.kubernetes.io/customer-owned-ipv4-pool`</a> specifies the customer-owned IPv4 address pool for ALB on Outpost.
+    
+    !!!warning ""
+        This annotation should be treated as immutable. To remove or change coIPv4Pool, you need to recreate Ingress.
+
+    !!!example
+        ```
+        alb.ingress.kubernetes.io/customer-owned-ipv4-pool: ipv4pool-coip-xxxxxxxx
+        ```
+
 ## Traffic Routing
 Traffic Routing can be controlled with following annotations:
 
@@ -140,6 +152,9 @@ Traffic Routing can be controlled with following annotations:
 
             - [amazon-vpc-cni-k8s](https://github.com/aws/amazon-vpc-cni-k8s)
 
+        !!!note ""
+            `ip` mode is required for sticky sessions to work with Application Load Balancers.
+
     !!!example
         ```
         alb.ingress.kubernetes.io/target-type: instance
@@ -150,6 +165,13 @@ Traffic Routing can be controlled with following annotations:
     !!!example
         ```
         alb.ingress.kubernetes.io/backend-protocol: HTTPS
+        ```
+
+- <a name="backend-protocol-version">`alb.ingress.kubernetes.io/backend-protocol-version`</a> specifies the application protocol used to route traffic to pods. Only valid when HTTP or HTTPS is used as the backend protocol. 
+
+    !!!example
+        ```
+        alb.ingress.kubernetes.io/backend-protocol-version: HTTP2
         ```
 
 - <a name="subnets">`alb.ingress.kubernetes.io/subnets`</a> specifies the [Availability Zone](http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-regions-availability-zones.html) that ALB will route traffic to. See [Load Balancer subnets](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-subnets.html) for more details.
@@ -613,9 +635,10 @@ Custom attributes to LoadBalancers and TargetGroups can be controlled with follo
             ```
             alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds=30
             ```
-        - enable sticky sessions (Please remember to check the target group type to have the appropriate behavior).
+        - enable sticky sessions (requires `alb.ingress.kubernetes.io/target-type` be set to `ip`)
             ```
             alb.ingress.kubernetes.io/target-group-attributes: stickiness.enabled=true,stickiness.lb_cookie.duration_seconds=60
+            alb.ingress.kubernetes.io/target-type: ip
             ```
         - set load balancing algorithm to least outstanding requests
                     ```
